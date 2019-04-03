@@ -1,0 +1,423 @@
+--Author: Namrata Khatri
+--Date 22-2-2019
+
+-- IMPORTANT: BEFORE CREATING ANY TABLE, MAKE SURE YOU RUN THIS COMMAND 
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+
+-- CREATE EXTERNAL TABLE 
+
+DROP TABLE IF EXISTS nyc_taxi_table;
+create external table if not exists nyc_taxi_table
+(VendorID int,
+tpep_pickup_datetime string,
+tpep_dropoff_datetime string,
+passenger_count int,
+trip_distance double,
+RatecodeID int,
+store_and_fwd_flag string,
+PULocationID int,
+DOLocationID int,
+payment_type int,
+fare_amount double ,
+extra double,
+mta_tax double,
+tip_amount double,
+tolls_amount double,
+improvement_surcharge double,
+total_amount double) 
+ROW FORMAT DELIMITED FIELDS TERMINATED BY','
+LOCATION '/common_folder/nyc_taxi_data/'
+tblproperties ("skip.header.line.count" = "1");
+
+--Basic Data Quality Checks
+
+--How many records has each TPEP provider provided? Write a query that summarises the number of records of each provider.
+
+select count(*) as no_of_records
+from nyc_taxi_table
+group by VendorID;
+
+--2	647183
+--1	527386
+
+
+-- we can find records where pickup time is in 10th month night and drop time is in 11th month morning.. or pickup time before 31st dec 2017 and drop off jan 1st 2018.
+--One of the requirement of the assignment is "we ONLY consider the data of yellow taxis for November and December of the year 2017." 
+--so considering only those trip where pickup time fall into 11 and 12th month of 2017
+   
+-- extra rows where pick ups are not from 11, 12th month of 2017
+-- need to discard below rows.
+
+select tpep_pickup_datetime,distinct( x.tpep_dropoff_datetime)
+from
+(select tpep_pickup_datetime, tpep_dropoff_datetime
+from nyc_taxi_table
+where month(tpep_pickup_datetime) not in (11,12) or 
+ year(tpep_pickup_datetime) Not in(2017,2018)
+union all
+select tpep_pickup_datetime, tpep_dropoff_datetime
+from nyc_taxi_table
+where month(tpep_dropoff_datetime) not in (11,12,1) or 
+ year(tpep_dropoff_datetime) Not in(2017,2018)) as x;
+
+--since its union all records in both query appears 
+-- there are 6 duplicate records in total 21 
+-- so 15 such records are there where pickup date does not fall into 11,12th month of 2017
+
+---------------------------
+select count(*) from nyc_taxi_table; --1174569
+
+select  year(tpep_pickup_datetime),month(tpep_pickup_datetime),count(*)
+from nyc_taxi_table
+where month(tpep_pickup_datetime)  in (11,12) 
+and month(tpep_dropoff_datetime) in (11,12,1)
+and year(tpep_pickup_datetime) = 2017
+and year( tpep_dropoff_datetime) in (2017,2018)
+group by year(tpep_pickup_datetime),month(tpep_pickup_datetime);
+
+--2017	11	580299
+--2017	12	594255
+-- 1174554 which is 15 less than total 1174569
+
+
+--You might have encountered unusual or erroneous rows in the dataset. Can you conclude which vendor is doing a bad job in providing the records using different columns of the dataset? Summarise your conclusions based on every column where these errors are present. For example,  There are unusual passenger count, i.e. 0 which is unusual.
+
+-- we have found below records in database, which indicates error if we follow data dictionary description.
+
+-- Passenger count = 0 
+-- Trip Distance = 0
+-- RateCodeID = 99
+-- FareAmount  < 0
+-- Extra should only include $0.5 and $1
+-- MTA Tax not in (0.5, 0)
+-- Improvement tax not in (0.3,0)
+-- Tip_amount < 0
+-- toll_amount < 0 
+-- Total_amount < 0
+-- drop time < pickuptime
+
+select count(*) 
+from nyc_taxi_table
+where passenger_count <= 0; --6824
+
+select count(*) 
+from nyc_taxi_table
+where  trip_distance <= 0; --7402
+
+
+select count(*) 
+from nyc_taxi_table
+where ratecodeid not in (1,2,3,4,5,6) --9
+
+
+select count(*) 
+from nyc_taxi_table
+where fare_amount <= 0; -- 870
+
+
+select count(*) 
+from nyc_taxi_table
+where extra  not in (0,0.5,1); --4856
+
+select count(*) 
+from nyc_taxi_table
+where mta_tax not in(0.5,0); --5745 
+
+select count(*) 
+from nyc_taxi_table 
+where improvement_surcharge not in (0.3,0)  --849
+
+select count(*) 
+from nyc_taxi_table
+where tip_amount < 0; --4
+ 
+select count(*) 
+from nyc_taxi_table
+where Tolls_amount < 0; --3
+
+select count(*) 
+from nyc_taxi_table
+where Total_amount <= 0; --681
+
+--create a clean, ORC partitioned table for analysis. Remove all the erroneous rows.
+
+
+-- First drop the table 
+drop table nyc_taxi_table_partitioned;
+
+-- Then create external table 
+create external table if not exists nyc_taxi_table_partitioned
+(VendorID int,
+tpep_pickup_datetime timestamp,
+tpep_dropoff_datetime timestamp,
+passenger_count int,
+trip_distance double,
+RatecodeID int,
+store_and_fwd_flag string,
+PULocationID int,
+DOLocationID int,
+payment_type int,
+fare_amount double ,
+extra double,
+mta_tax double,
+tip_amount double,
+tolls_amount double,
+improvement_surcharge double,
+total_amount double) partitioned by (mnth int, mday int)
+location '/user/hive/warehouse/nyc_taxi_table_month_day_partitioned';
+
+
+-- Then insert the data in the table 
+insert overwrite table nyc_taxi_table_partitioned
+partition(mnth, mday)
+select VendorID ,
+from_unixtime(unix_timestamp( tpep_pickup_datetime,"yyyy-MM-dd HH:mm:ss")),
+from_unixtime(unix_timestamp( tpep_dropoff_datetime,"yyyy-MM-dd HH:mm:ss")),
+passenger_count,trip_distance,RatecodeID,store_and_fwd_flag,
+PULocationID,DOLocationID,payment_type,fare_amount,extra,
+mta_tax,tip_amount,tolls_amount,improvement_surcharge,total_amount,
+month(tpep_pickup_datetime) as mnth, day(tpep_pickup_datetime) as mday
+from nyc_taxi_table
+where 
+passenger_count > 0
+and trip_distance > 0
+and ratecodeid in (1,2,3,4,5,6)
+and fare_amount > 0
+and extra  in (0,0.5,1)
+and mta_tax in (0.5,0)
+and improvement_surcharge in(0.3,0)
+and tolls_amount >= 0
+and tip_amount >= 0
+and Total_amount > 0
+and month(tpep_pickup_datetime)  in (11,12) 
+and month(tpep_dropoff_datetime) in (11,12,1)
+and year(tpep_pickup_datetime) = 2017
+and year( tpep_dropoff_datetime) in (2017,2018)
+and from_unixtime(unix_timestamp(tpep_dropoff_datetime)) > from_unixtime(unix_timestamp(tpep_pickup_datetime));
+
+select count(*) from nyc_taxi_table_partitioned; --1150143
+
+-- ORC FILE FORMAT 
+drop table nyc_taxi_table_partitioned_orc;
+
+-- First, create ORC table 
+create external table if not exists nyc_taxi_table_partitioned_orc
+(VendorID int,
+tpep_pickup_datetime timestamp,
+tpep_dropoff_datetime timestamp,
+passenger_count int,
+trip_distance double,
+RatecodeID int,
+store_and_fwd_flag string,
+PULocationID int,
+DOLocationID int,
+payment_type int,
+fare_amount double ,
+extra double,
+mta_tax double,
+tip_amount double,
+tolls_amount double,
+improvement_surcharge double,
+total_amount double) partitioned by (mnth int, mday int)
+location '/user/hive/warehouse/nyc_taxi_table_month_day_partitioned_orc'
+tblproperties ("orc.compress"="SNAPPY");
+
+-- Then, write data from partition table into ORC table 
+
+insert overwrite table nyc_taxi_table_partitioned_orc partition(mnth,mday)
+select * from nyc_taxi_table_partitioned;
+
+
+---------------------------------------------------------------
+--Analysis-I
+
+--1.Compare the overall average fare per trip for November and December.
+
+select mnth,avg(total_amount) as avg_fare
+from nyc_taxi_table_partitioned_orc
+group by mnth
+order by mnth;
+
+--11		15.967673177263379
+--12		15.667402511093925
+
+
+--2.Explore the ‘number of passengers per trip’ - how many trips are made by each level of ‘Passenger_count’? Do most people travel solo or with other people?
+
+select passenger_count,count( tpep_pickup_datetime)  as no_of_trips
+from nyc_taxi_table_partitioned_orc
+group by passenger_count
+order by no_of_trips desc;
+
+
+--passenger_count	no_of_trips
+--1		814706
+--2		174117
+--3		53909
+--4		50027
+--5		32809
+--6		24572
+--7		3
+
+--yes, most people travel solo
+
+
+--3.Which is the most preferred mode of payment?
+
+select payment_type, count( tpep_pickup_datetime) as no_of_trips
+from nyc_taxi_table_partitioned_orc
+group by payment_type 
+order by no_of_trips desc;
+
+
+--payment_type	no_of_trips
+--1		776539
+--2		367912
+--3		4412
+--4		1280
+
+--preferred mode of payment is 1 which is  Credit card 
+
+
+
+--4.What is the average tip paid per trip? Compare the average tip with the 25th, 50th and 75th percentiles and comment whether the ‘average tip’ is a representative statistic (of the central tendency) of ‘tip amount paid’. Hint: You may use percentile_approx(DOUBLE col, p): Returns an approximate pth percentile of a numeric column (including floating point types) in the group.
+
+select avg(tip_amount) as avg_tip,
+percentile_approx(tip_amount,array(0.25,0.5,0.75)) as prctile 
+from nyc_taxi_table_partitioned_orc;
+
+-- average is 1.8 and median = 1.36 which is 0.5 percentile so we can say average falls little far 0.44  from central tendency.
+
+-- avg_tip			prctile
+--1.8006599440244788	      [0.0,1.36,2.45]
+
+
+--5.Explore the ‘Extra’ (charge) variable - what fraction of total trips have an extra charge is levied?
+
+select  mnth,sum(if( extra == 0, 0 , 1 ) )/ count(*) * 100 as extra_pct
+FROM nyc_taxi_table_partitioned_orc
+group by mnth;
+
+select  sum(if( extra == 0, 0 , 1 ) )/ count(*) * 100 as extra_pct
+FROM nyc_taxi_table_partitioned_orc;
+
+--46.23% of total trips have extra charges levied.
+
+---------------------------------------------------------------------
+--Analysis-II
+
+--1.What is the correlation between the number of passengers on any given trip, and the 
+--tip paid per trip? Do multiple travellers tip more compared to solo travellers? Hint: 
+--Use CORR(Col_1, Col_2)
+
+
+select passenger_count,round(avg(tip_amount),2) as avg_tip
+from nyc_taxi_table_partitioned_orc
+group by passenger_count
+order by passenger_count ;
+
+--passenger_count	avg_tip
+--1		1.81
+--2		1.8
+--3		1.72
+--4		1.58
+--5		1.84
+--6		1.8
+--7		5.23
+
+select corr( passenger_count, tip_amount)
+from nyc_taxi_table_partitioned_orc;
+
+--cor_passenger_tip
+-- -0.0048
+
+--1)There is very little -ve correlation between no of passenger and tip given 
+--2)No, avgerage multiple traveler's tip is not more compared to solo traveller's avgerage tip
+
+
+--2.Segregate the data into five segments of ‘tip paid’: [0-5), [5-10), [10-15) , [15-20)
+-- and >=20. Calculate the percentage share of each bucket (i.e. the fraction of trips 
+--falling in each bucket).
+
+select round(sum(if(tip_amount>=0  and tip_amount < 5,1,0))/count(1) * 100,2)as tip_0_to_5_fraction,
+       round(sum(if(tip_amount>=5  and tip_amount < 10,1,0))/count(1) * 100,2)as tip_5_to_10_fraction,
+       round(sum(if(tip_amount>=10  and tip_amount < 15,1,0))/count(1) * 100,2)as tip_10_to_15_fraction,
+       round(sum(if(tip_amount>=15  and tip_amount < 20,1,0))/count(1) * 100,2)as tip_15_to_20_fraction,
+       round(sum(if(tip_amount>=20 ,1,0))/count(1) *100 ,2)as tip_more_than_20_fraction
+from nyc_taxi_table_partitioned_orc;
+
+ 	
+-- tip_0_to_5_fraction	tip_5_to_10_fraction	tip_10_to_15_fraction	
+-- 92.57			5.63			1.63	
+-- tip_15_to_20_fraction	tip_more_than_20_fraction
+-- 0.11			0.05	
+
+
+
+--3.Which month has a greater average ‘speed’ - November or December? Note that the 
+--variable ‘speed’ will have to be derived from other metrics. Hint: You have columns for 
+--distance and time.
+
+select mnth,
+    round(avg((trip_distance*60)/(minute(tpep_dropoff_datetime) - minute(tpep_pickup_datetime))),2) as avg_speed_miles_per_hour 
+from nyc_taxi_table_partitioned_orc
+group by mnth
+order by mnth;
+
+
+--mnth	avg_speed_miles_per_hour
+
+--11	5.41
+--12	5.86
+
+--4.Analyse the average speed of the most happening days of the year, i.e. 31st December 
+--(New year’s eve) and 25th December (Christmas) and compare it with the overall average. 
+
+select mday,
+    round(avg((trip_distance*60)/(minute(tpep_dropoff_datetime) - minute(tpep_pickup_datetime))),2) as avg_speed_miles_per_hour 
+from nyc_taxi_table_partitioned_orc
+where mnth = 12 and mday in (25,31)
+group by mday
+order by mday;
+
+
+--mday	avg_speed_miles_per_hour
+--25	9.65
+--31	8.59
+
+
+
+--------------
+
+select count(*) from nyc_taxi_table_partitioned_orc; --1150143
+
+select count(*) 
+from nyc_taxi_table
+where passenger_count <= 0; --6824
+
+select count(*) 
+from nyc_taxi_table
+where  trip_distance <= 0; --7402
+
+
+select count(*) 
+from nyc_taxi_table
+where ratecodeid =99; --9
+
+
+select count(*) 
+from nyc_taxi_table
+where fare_amount <= 0; -- 870
+
+
+select count(*) 
+from nyc_taxi_table
+where extra  not in (0,0.5,1); --4856
+
+select count(*) 
+from nyc_taxi_table
+where mta_tax != 0.5; --5745
